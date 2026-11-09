@@ -65,7 +65,7 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
                 await client.close()
 
         text = asyncio.run(transcript())
-        assert "[Session handoff]" in text and "parent-session" in text
+        assert "[Handoff document]" in text and "Please stand by" in text and "parent-session" in text
     finally:
         handle.process.terminate()
         handle.process.wait(timeout=30)

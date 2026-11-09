@@ -15,7 +15,6 @@ from agent_zoo.runtime_launch import Fresh, InstanceRef, RuntimeLaunch, RuntimeS
 from agent_zoo.session_store import resolve_local_root
 
 HANDOFF_KIND = "handoff"
-HANDOFF_HEADER = "Session handoff"
 MAX_TITLE_CHARS = 80
 
 NO_HANDOFF = (
@@ -51,26 +50,18 @@ def handoff_message(state, doc) -> str:
     session_id = str(getattr(state, "_session_id", "") or "")
     title = _parent_title(state)
     source = f'"{title}" (session {session_id})' if title else f"session {session_id}"
-    lines = [
-        f"[{HANDOFF_HEADER}]",
-        f"This is a fresh session that continues the work of the previous agent-zoo "
-        f"session {source}. That session's transcript is not loaded here. The handoff "
-        f"document below summarizes transcript entries {doc.source_start_entry_index}"
-        f"-{doc.source_end_entry_index} of that session; treat it as your working "
-        f"memory of the earlier work.",
-    ]
+    intro = (
+        f"[System]: The user initialized this fresh conversation with a handoff "
+        f"document summarizing a previous conversation, {source}."
+    )
     later = unsummarized_entries(state, doc)
     if later:
-        lines.append(
-            f"The previous session continued for {later} more transcript entries after "
-            f"this handoff was written. That later work is not summarized here, so "
-            f"confirm current state with the user or the files before relying on it."
+        intro += (
+            f" The previous conversation had {later} more transcript entries after the "
+            f"handoff was written, so the document may not reflect the most recent work."
         )
-    lines.append(
-        "If you need exact details that the handoff omits, look up the previous "
-        "session's saved history by its session id."
-    )
-    return "\n".join(lines) + "\n\n" + doc.text.strip()
+    closing = "[System]: Please stand by for new instructions from the user."
+    return f"{intro}\n\n[Handoff document]\n{doc.text.strip()}\n[End of handoff document]\n\n{closing}"
 
 
 def launch_settings(state, config) -> RuntimeSettings:

@@ -78,7 +78,6 @@ def test_spawns_fresh_session_with_latest_handoff_and_attaches(tmp_path):
     assert request.first_user_message == ""
     assert "newest memory" in request.startup_system_message
     assert "old memory" not in request.startup_system_message
-    assert "entries 0-9" in request.startup_system_message
     assert request.settings.project == "demo" and request.settings.model == "opus"
     assert request.settings.config_sets == ("a.b=1",)
     assert request.target.session_id != "parent-session"
@@ -146,3 +145,14 @@ def test_registers_one_feature():
     (feature,) = added
     assert feature.name == "handoff_command"
     assert [c.path for c in feature.components] == ["/handoff"]
+
+
+def test_message_frames_handoff_as_user_action_and_ends_with_standby(tmp_path):
+    state = make_state(tmp_path, [make_doc(11, "MEMORY")])
+    run(state)
+    message = state.session_launcher.requests[0].startup_system_message
+    assert message.startswith("[System]: The user initialized this fresh conversation with a handoff document")
+    assert '"Parser work" (session parent-session)' in message
+    memory = message.index("MEMORY")
+    standby = message.index("Please stand by for new instructions")
+    assert memory < standby and message.rstrip().endswith("new instructions from the user.")

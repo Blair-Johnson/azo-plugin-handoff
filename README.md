@@ -15,8 +15,9 @@ so the new agent starts with a small, focused context.
 /handoff finish the parser     # also send a first message to the new agent
 ```
 
-The new session receives one system message that names the source session and
-the transcript range that the handoff covers, followed by the handoff text. If
+The new session receives one system message. It says that the user started the
+conversation with a handoff document from the source session, includes the
+handoff text, and asks the agent to stand by for new instructions. If
 the source session continued after the handoff was written, the message and the
 command notice both say how many transcript entries were not summarized.
 
