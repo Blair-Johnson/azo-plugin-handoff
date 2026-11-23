@@ -1,21 +1,27 @@
-"""Dispatch /handoff through a real pipeline and command dispatcher with a fake launcher."""
+"""Dispatch /handoff through a real pipeline and SimSessionDriver (100% Sans-I/O)."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
-from agent_utils.core.events import IoCompleted, IoFailed
+from agent_utils.core.events import IoFailed
 from agent_utils.core.io import SubmitOp
 from agent_utils.core.pipeline import Feature, PipelineBuilder
 from agent_utils.core.session import Session
 from agent_utils.core.state import State
 from agent_utils.features.core import core_feature
+from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
+from agent_zoo.drivers.sessions import SimSessionDriver
 from agent_zoo.events import (
     EmitNotice,
-    ReplyFrontendRequest,
-    RunPluginTask,
+    PublishView,
+    SessionArtifact,
+    SessionSource,
+    SessionSpawnResult,
+    SessionSpec,
     SlashCommand,
+    SpawnSession,
 )
 from agent_zoo.features.commands import (
     CommandContext,
@@ -25,22 +31,9 @@ from agent_zoo.features.commands import (
     commands_feature,
 )
 from agent_zoo.features.compaction import ContextCompactionState, ContextHandoffDoc
-from agent_zoo.host.launch import Fresh, RuntimeLaunch
 from agent_zoo.pipelines.default import build_default_builder
 
 import handoff
-
-
-class FakeLauncher:
-    def __init__(self):
-        self.requests = []
-
-    def prepare(self, request):
-        self.requests.append(request)
-        return request
-
-    def start(self, plan):
-        return SimpleNamespace(stderr_path="/tmp/handoff/stderr.log")
 
 
 class NoticeRecorder:
@@ -84,9 +77,9 @@ def make_state(tmp_path, docs=(), entries=12) -> State:
     state._agent_zoo_context = {
         "project_name": "demo",
         "project_store_root": str(tmp_path / "store"),
+        "state_root": str(tmp_path / "state"),
     }
     state._persistence_local_root = str(tmp_path / "local")
-    state.session_launcher = FakeLauncher()
     return state
 
 
@@ -114,25 +107,28 @@ def run_pipeline(state: State, raw="/handoff", config=CONFIG):
     handoff.register_features(builder, session=session, config=config)
     session.pipeline = builder.build(suppress_warnings=True)
 
-    effects = session.step(SlashCommand(raw=raw))
-    plugin_ops = [
-        eff
-        for eff in effects
-        if isinstance(eff, SubmitOp) and isinstance(eff.request, RunPluginTask)
-    ]
-    attach_effects = []
-    for op in plugin_ops:
-        try:
-            value = op.request.fn(*op.request.args, **op.request.kwargs)
-            follow_effects = session.step(IoCompleted(op_id=op.op_id, value=value))
-        except Exception as exc:
-            follow_effects = session.step(IoFailed(op_id=op.op_id, error=exc))
-        attach_effects.extend(
-            eff.request
-            for eff in follow_effects
-            if isinstance(eff, SubmitOp) and isinstance(eff.request, ReplyFrontendRequest)
-        )
-    return recorder.notices, attach_effects
+    sim_sessions = SimSessionDriver()
+    spawn_requests: list[SpawnSession] = []
+    publish_views: list[PublishView] = []
+
+    sim = SimulationRuntime(session)
+
+    def _on_spawn(op_id, req, runtime):
+        spawn_requests.append(req)
+        outcome = sim_sessions.handle(op_id, req, runtime)
+        if isinstance(outcome, SimOutcome) and isinstance(outcome.value, SessionSpawnResult):
+            outcome.value.stderr_path = "/tmp/handoff/stderr.log"
+        return outcome
+
+    def _on_publish_view(_op_id, req, _runtime):
+        publish_views.append(req)
+        return SimOutcome(value=None, delay=0.0)
+
+    sim.register_handler(SpawnSession, _on_spawn)
+    sim.register_handler(PublishView, _on_publish_view)
+    sim.inject(SlashCommand(raw=raw))
+    sim.run_until_idle()
+    return recorder.notices, spawn_requests, publish_views, sim_sessions
 
 
 def notice_text(notices):
@@ -141,70 +137,91 @@ def notice_text(notices):
 
 def test_spawns_fresh_session_with_latest_handoff_and_attaches(tmp_path):
     state = make_state(tmp_path, [make_doc(5, "old memory"), make_doc(9, "newest memory")])
-    notices, replies = run_pipeline(state)
-    (request,) = state.session_launcher.requests
-    assert isinstance(request, RuntimeLaunch) and isinstance(request.source, Fresh)
-    assert request.kind == "handoff" and request.parent_session_id == "parent-session"
-    assert request.title == "handoff: Parser work"
-    assert request.first_user_message == ""
-    assert "newest memory" in request.startup_system_message
-    assert "old memory" not in request.startup_system_message
-    assert request.settings.project == "demo" and request.settings.model == "opus"
-    assert request.settings.config_sets == ("a.b=1",)
-    assert request.target.session_id != "parent-session"
-    assert len(replies) == 1
-    assert replies[0].channel == "core"
-    assert replies[0].event_type == "attach"
-    assert replies[0].payload == {
-        "session_id": request.target.session_id,
+    notices, requests, views, sim_sessions = run_pipeline(state)
+    (request,) = requests
+    assert isinstance(request, SpawnSession)
+    assert request.source == SessionSource(kind="fresh")
+    assert request.wait_ready is False
+    assert isinstance(request.spec, SessionSpec)
+    assert request.spec.kind == "handoff"
+    assert request.spec.spawn_policy == "root"
+    assert request.spec.lifetime == "independent"
+    assert request.spec.parent_session_id == "parent-session"
+    assert request.spec.title == "handoff: Parser work"
+    assert request.spec.first_user_message == ""
+    assert "newest memory" in request.spec.startup_system_message
+    assert "old memory" not in request.spec.startup_system_message
+    assert request.spec.project == "demo" and request.spec.model == "opus"
+    assert request.spec.config_sets == ("a.b=1",)
+    assert request.spec.state_root == str(tmp_path / "state")
+    assert request.spec.store_root == str(tmp_path / "store")
+    assert request.spec.local_state_root == str(tmp_path / "local")
+
+    assert len(request.inputs) == 1
+    art = request.inputs[0]
+    assert isinstance(art, SessionArtifact)
+    assert art.name == "handoff_doc"
+    assert art.kind == "text"
+    assert art.content_type == "text/markdown"
+    assert art.data == "newest memory"
+    assert art.metadata["source_session_id"] == "parent-session"
+    assert art.metadata["source_end_entry_index"] == 9
+
+    (spawned,) = sim_sessions.sessions.values()
+    assert spawned.session_id != "parent-session"
+    assert len(views) == 1
+    assert views[0].attach == {
+        "session_id": spawned.session_id,
         "kind": "handoff",
+        "instance_id": spawned.instance_id,
+        "websocket_url": spawned.websocket_url,
     }
-    assert request.target.session_id[:8] in notice_text(notices)
+    assert spawned.session_id[:8] in notice_text(notices)
+    assert "/tmp/handoff/stderr.log" in notice_text(notices)
 
 
 def test_message_becomes_first_user_turn(tmp_path):
     state = make_state(tmp_path, [make_doc(11)])
-    run_pipeline(state, "/handoff  finish the parser tests ")
-    (request,) = state.session_launcher.requests
-    assert request.first_user_message == "finish the parser tests"
+    _, requests, _, _ = run_pipeline(state, "/handoff  finish the parser tests ")
+    (request,) = requests
+    assert request.spec.first_user_message == "finish the parser tests"
 
 
 def test_reports_entries_newer_than_the_handoff(tmp_path):
     state = make_state(tmp_path, [make_doc(5)], entries=12)
-    notices, _ = run_pipeline(state)
-    (request,) = state.session_launcher.requests
-    assert "6 more transcript entries" in request.startup_system_message
+    notices, requests, _, _ = run_pipeline(state)
+    (request,) = requests
+    assert "6 more transcript entries" in request.spec.startup_system_message
     assert "last 6 transcript entries" in notice_text(notices)
+    assert request.inputs[0].metadata["unsummarized_entries"] == 6
 
 
 def test_current_handoff_has_no_staleness_note(tmp_path):
     state = make_state(tmp_path, [make_doc(11)], entries=12)
-    notices, _ = run_pipeline(state)
-    assert (
-        "more transcript entries"
-        not in state.session_launcher.requests[0].startup_system_message
-    )
+    notices, requests, _, _ = run_pipeline(state)
+    assert "more transcript entries" not in requests[0].spec.startup_system_message
     assert "/compact" not in notice_text(notices)
 
 
 def test_without_handoff_reports_error_and_launches_nothing(tmp_path):
     state = make_state(tmp_path)
-    notices, replies = run_pipeline(state)
+    notices, requests, views, _ = run_pipeline(state)
     assert notices[0].level == "error" and "/compact" in notices[0].text
-    assert not state.session_launcher.requests and not replies
+    assert not requests and not views
 
 
 def test_skips_handoffs_beyond_a_rewound_transcript(tmp_path):
     state = make_state(
         tmp_path, [make_doc(5, "kept"), make_doc(30, "rewound away")], entries=12
     )
-    run_pipeline(state)
-    assert "kept" in state.session_launcher.requests[0].startup_system_message
+    _, requests, _, _ = run_pipeline(state)
+    assert "kept" in requests[0].spec.startup_system_message
+    assert requests[0].inputs[0].data == "kept"
 
 
 def test_unavailable_without_live_backend(tmp_path):
     state = make_state(tmp_path, [make_doc(5)])
-    state.session_launcher = None
+    state._session_id = ""
     registry = CommandRegistry([handoff.make_handoff_command(CONFIG)])
     ctx = CommandContext(
         state=state,
@@ -213,6 +230,20 @@ def test_unavailable_without_live_backend(tmp_path):
         config=CONFIG,
     )
     with pytest.raises(CommandError, match="live agent backend"):
+        registry.execute("/handoff", ctx)
+
+
+def test_missing_project_or_model_raises_command_error(tmp_path):
+    state = make_state(tmp_path, [make_doc(5)])
+    state._agent_zoo_context = {}
+    registry = CommandRegistry([handoff.make_handoff_command({"llm": {"default": "opus"}})])
+    ctx = CommandContext(
+        state=state,
+        emit=lambda _ev: None,
+        registry=registry,
+        config={"llm": {"default": "opus"}},
+    )
+    with pytest.raises(CommandError, match="known project and model"):
         registry.execute("/handoff", ctx)
 
 
@@ -232,8 +263,39 @@ def test_model_follows_live_config(tmp_path):
     assert result.operation_id is not None
     effects = state.io.take_outbox()
     (op,) = [eff for eff in effects if isinstance(eff, SubmitOp)]
-    op.request.fn(*op.request.args, **op.request.kwargs)
-    assert state.session_launcher.requests[0].settings.model == "sonnet"
+    assert isinstance(op.request, SpawnSession)
+    assert op.request.spec.model == "sonnet"
+
+
+def test_spawn_failure_emits_error_notice_and_no_attach(tmp_path):
+    state = make_state(tmp_path, [make_doc(5)])
+    recorder = NoticeRecorder()
+    session = Session(state=state)
+    builder = (
+        PipelineBuilder()
+        .add(core_feature())
+        .add(commands_feature(config=CONFIG))
+        .add(
+            Feature(
+                name="test_notice_recorder",
+                components=[recorder],
+                order=[SlashCommandDispatcher, NoticeRecorder],
+            )
+        )
+    )
+    handoff.register_features(builder, session=session, config=CONFIG)
+    session.pipeline = builder.build(suppress_warnings=True)
+
+    effects = session.step(SlashCommand(raw="/handoff"))
+    (spawn_op,) = [
+        eff for eff in effects if isinstance(eff, SubmitOp) and isinstance(eff.request, SpawnSession)
+    ]
+    follow = session.step(IoFailed(op_id=spawn_op.op_id, error=RuntimeError("boom")))
+    assert not [
+        eff for eff in follow if isinstance(eff, SubmitOp) and isinstance(eff.request, PublishView)
+    ]
+    assert recorder.notices[-1].level == "error"
+    assert "boom" in recorder.notices[-1].text
 
 
 def test_registers_one_feature():
@@ -250,8 +312,8 @@ def test_registers_one_feature():
 
 def test_message_frames_handoff_as_user_action_and_ends_with_standby(tmp_path):
     state = make_state(tmp_path, [make_doc(11, "MEMORY")])
-    run_pipeline(state)
-    message = state.session_launcher.requests[0].startup_system_message
+    _, requests, _, _ = run_pipeline(state)
+    message = requests[0].spec.startup_system_message
     assert message.startswith(
         "[System]: The user initialized this fresh conversation with a handoff document"
     )
@@ -276,3 +338,100 @@ def test_composes_onto_default_builder():
     assert any(
         isinstance(comp, handoff.HandoffCompletionHandler) for comp in pipeline
     )
+
+
+def test_module_is_pure_sans_io():
+    for forbidden in (
+        "RuntimeLauncher",
+        "RuntimeLaunch",
+        "RuntimeSettings",
+        "RunPluginTask",
+        "ReplyFrontendRequest",
+        "launch_settings",
+        "build_request",
+        "resolve_state_root",
+        "resolve_local_root",
+    ):
+        assert not hasattr(handoff, forbidden), f"unexpected legacy symbol: {forbidden}"
+
+
+def test_spawn_session_passes_real_session_driver_contract(tmp_path):
+    """Verify SpawnSession + SessionArtifact flows cleanly through AgentZooSessionDriver."""
+    import json
+    import queue
+    from agent_utils.core.events import IoCompleted
+    from agent_zoo.drivers.sessions import AgentZooSessionDriver
+
+    captured = {}
+
+    class FakeDriverLauncher:
+        def prepare(self, request, *, cwd=None, env=None):
+            captured["request"] = request
+            captured["cwd"] = cwd
+            captured["env"] = dict(env or {})
+            return SimpleNamespace(request=request, cwd=cwd, environment=captured["env"])
+
+        def start(self, plan):
+            return SimpleNamespace(
+                request=plan.request,
+                process=SimpleNamespace(pid=4242, poll=lambda: None),
+                ready_file=str(tmp_path / "ready.json"),
+                stdout_path=str(tmp_path / "stdout.log"),
+                stderr_path=str(tmp_path / "stderr.log"),
+            )
+
+    state = make_state(tmp_path, [make_doc(9, "handoff body")])
+    session = Session(state=state)
+    builder = (
+        PipelineBuilder()
+        .add(core_feature())
+        .add(commands_feature(config=CONFIG))
+    )
+    handoff.register_features(builder, session=session, config=CONFIG)
+    session.pipeline = builder.build(suppress_warnings=True)
+
+    effects = session.step(SlashCommand(raw="/handoff continue work"))
+    (spawn_op,) = [
+        eff for eff in effects if isinstance(eff, SubmitOp) and isinstance(eff.request, SpawnSession)
+    ]
+
+    inbox: queue.Queue = queue.Queue()
+    driver = AgentZooSessionDriver(
+        launcher=FakeDriverLauncher(),
+        store_root=str(tmp_path / "store"),
+        local_state_root=str(tmp_path / "local"),
+    )
+    driver.start(inbox.put)
+    try:
+        driver.submit(spawn_op.op_id, spawn_op.request)
+        event = inbox.get(timeout=5)
+    finally:
+        driver.close(leave_children=True)
+
+    assert isinstance(event, IoCompleted)
+    assert isinstance(event.value, SessionSpawnResult)
+    assert event.value.stderr_path == str(tmp_path / "stderr.log")
+
+    launch = captured["request"]
+    assert launch.kind == "handoff"
+    assert launch.spawn_policy == "root"
+    assert launch.lifetime == "independent"
+    assert launch.first_user_message == "continue work"
+    assert "handoff body" in launch.startup_system_message
+
+    encoded_inputs = json.loads(captured["env"]["AZO_SESSION_INPUTS"])
+    assert len(encoded_inputs) == 1
+    assert encoded_inputs[0]["name"] == "handoff_doc"
+    assert encoded_inputs[0]["kind"] == "text"
+    assert encoded_inputs[0]["content_type"] == "text/markdown"
+    assert encoded_inputs[0]["data"] == "handoff body"
+
+    follow = session.step(event)
+    (view_op,) = [
+        eff for eff in follow if isinstance(eff, SubmitOp) and isinstance(eff.request, PublishView)
+    ]
+    assert view_op.request.attach == {
+        "session_id": event.value.session_id,
+        "kind": "handoff",
+        "instance_id": event.value.instance_id,
+    }

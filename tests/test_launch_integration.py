@@ -1,4 +1,4 @@
-"""Launch a genuine isolated child runtime; deliberately make no model call.
+"""Launch a genuine isolated child runtime via AgentZooSessionDriver; no model call.
 
 Opt in with AZO_HANDOFF_INTEGRATION=1 because it starts a backend process.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 
 import pytest
 
@@ -19,14 +20,27 @@ pytestmark = pytest.mark.skipif(
 def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("AGENT_ZOO_HOME", str(home))
+    from agent_utils.core.events import IoCompleted
+    from agent_utils.core.io import SubmitOp
+    from agent_utils.core.pipeline import PipelineBuilder
+    from agent_utils.core.session import Session
+    from agent_utils.features.core import core_feature
     from agent_zoo.cli.wsctl import AzoWs
     from agent_zoo.config.loader import load_layered_config
+    from agent_zoo.drivers.sessions import AgentZooSessionDriver
+    from agent_zoo.events import PublishView, SlashCommand, SpawnSession
+    from agent_zoo.features.commands import commands_feature
     from agent_zoo.host.launch import RuntimeLauncher
 
-    from test_handoff import make_doc, make_state, run_pipeline
+    import handoff
+    from test_handoff import make_doc, make_state
 
     config = load_layered_config(state_root=home)
-    config["_runtime_launch"] = {"config_path": "", "config_sets": ()}
+    config["_runtime_launch"] = {
+        "config_path": "",
+        "config_sets": (),
+        "state_root": str(home),
+    }
     if not (config.get("llm") or {}).get("default"):
         pytest.skip("bundled config has no default model")
 
@@ -43,38 +57,73 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
         tmp_path, [make_doc(5, "MEMORY-MARKER: parser refactor is half done.")]
     )
     state.cwd = str(workdir)
-    state.session_launcher = RecordingLauncher()
+    state._agent_zoo_context["state_root"] = str(home)
 
-    _notices, replies = run_pipeline(state, "/handoff", config=config)
-    (handle,) = handles
+    session = Session(state=state)
+    builder = (
+        PipelineBuilder()
+        .add(core_feature())
+        .add(commands_feature(config=config))
+    )
+    handoff.register_features(builder, session=session, config=config)
+    session.pipeline = builder.build(suppress_warnings=True)
+
+    inbox: queue.Queue = queue.Queue()
+    driver = AgentZooSessionDriver(
+        launcher=RecordingLauncher(),
+        store_root=state._agent_zoo_context["project_store_root"],
+        local_state_root=state._persistence_local_root,
+    )
+    driver.start(inbox.put)
     try:
-        ready = handle.wait_ready(timeout_s=90)
-        assert ready["session_id"] == replies[0].payload["session_id"]
+        effects = session.step(SlashCommand(raw="/handoff"))
+        (spawn_op,) = [
+            eff
+            for eff in effects
+            if isinstance(eff, SubmitOp) and isinstance(eff.request, SpawnSession)
+        ]
+        driver.submit(spawn_op.op_id, spawn_op.request)
+        completion = inbox.get(timeout=30)
+        assert isinstance(completion, IoCompleted), f"unexpected event: {completion!r}"
+        follow = session.step(completion)
+        attach_views = [
+            eff.request
+            for eff in follow
+            if isinstance(eff, SubmitOp) and isinstance(eff.request, PublishView)
+        ]
+        assert len(attach_views) == 1 and attach_views[0].attach is not None
 
-        async def transcript():
-            client = AzoWs.attach(
-                ready["websocket_url"],
-                modern=False,
-                terminate_on_close=False,
-                connect_timeout_s=10,
-            )
-            await client.connect()
-            try:
-                await client.subscribe_core()
-                return await client.wait_until(
-                    lambda obs: "MEMORY-MARKER" in obs.transcript_text()
-                    and obs.transcript_text(),
-                    timeout=30,
+        (handle,) = handles
+        try:
+            ready = handle.wait_ready(timeout_s=90)
+            assert ready["session_id"] == attach_views[0].attach["session_id"]
+
+            async def transcript():
+                client = AzoWs.attach(
+                    ready["websocket_url"],
+                    modern=False,
+                    terminate_on_close=False,
+                    connect_timeout_s=10,
                 )
-            finally:
-                await client.close()
+                await client.connect()
+                try:
+                    await client.subscribe_core()
+                    return await client.wait_until(
+                        lambda obs: "MEMORY-MARKER" in obs.transcript_text()
+                        and obs.transcript_text(),
+                        timeout=30,
+                    )
+                finally:
+                    await client.close()
 
-        text = asyncio.run(transcript())
-        assert (
-            "[Handoff document]" in text
-            and "Please stand by" in text
-            and "parent-session" in text
-        )
+            text = asyncio.run(transcript())
+            assert (
+                "[Handoff document]" in text
+                and "Please stand by" in text
+                and "parent-session" in text
+            )
+        finally:
+            handle.process.terminate()
+            handle.process.wait(timeout=30)
     finally:
-        handle.process.terminate()
-        handle.process.wait(timeout=30)
+        driver.close(leave_children=True)

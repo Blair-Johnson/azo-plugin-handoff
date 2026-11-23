@@ -17,8 +17,12 @@ from agent_utils.features.core import IoFence
 from agent_zoo.events import (
     EmitNotice,
     ProjectionRequested,
-    ReplyFrontendRequest,
-    RunPluginTask,
+    PublishView,
+    SessionArtifact,
+    SessionSource,
+    SessionSpawnResult,
+    SessionSpec,
+    SpawnSession,
 )
 from agent_zoo.features.commands import (
     Arg,
@@ -28,15 +32,6 @@ from agent_zoo.features.commands import (
     CommandResult,
 )
 from agent_zoo.features.compaction import latest_applicable_handoff
-from agent_zoo.host.launch import (
-    Fresh,
-    InstanceRef,
-    RuntimeLaunch,
-    RuntimeLauncher,
-    RuntimeSettings,
-)
-from agent_zoo.storage.projects import resolve_state_root
-from agent_zoo.storage.store import resolve_local_root
 
 HANDOFF_KIND = "handoff"
 MAX_TITLE_CHARS = 80
@@ -100,84 +95,13 @@ def handoff_message(state: Any, doc: Any) -> str:
     )
 
 
-def launch_settings(state: Any, config: dict[str, Any] | None) -> RuntimeSettings:
-    """Mirror the current runtime's project, roots, config and model."""
-    cfg = config or {}
-    context = dict(getattr(state, "_agent_zoo_context", None) or {})
-    provenance = cfg.get("_runtime_launch", {}) or {}
-    model = str(
-        (cfg.get("llm", {}) or {}).get("default")
-        or getattr(state, "active_model", "")
-        or ""
-    )
-    project = str(
-        context.get("project_name")
-        or getattr(state, "_project_name", "")
-        or ""
-    )
-    if not project or not model:
-        raise CommandError(
-            "/handoff needs a live backend with a known project and model."
-        )
-    return RuntimeSettings(
-        project=project,
-        workdir=_session_workdir(state),
-        state_root=str(resolve_state_root()),
-        store_root=str(context.get("project_store_root") or ""),
-        local_state_root=str(
-            getattr(state, "_persistence_local_root", "") or resolve_local_root(cfg)
-        ),
-        config_path=str(provenance.get("config_path") or ""),
-        config_sets=tuple(provenance.get("config_sets") or ()),
-        model=model,
-        env_name=str((cfg.get("pilot", {}) or {}).get("_env_name") or ""),
-    )
-
-
-def build_request(
-    state: Any,
-    config: dict[str, Any] | None,
-    doc: Any,
-    message: str = "",
-) -> RuntimeLaunch:
-    target = InstanceRef.new_session()
-    title = _parent_title(state)
-    title = (
-        f"handoff: {title}"[:MAX_TITLE_CHARS]
-        if title
-        else f"handoff {target.session_id[:8]}"
-    )
-    return RuntimeLaunch(
-        target=target,
-        source=Fresh(),
-        settings=launch_settings(state, config),
-        parent_session_id=str(getattr(state, "_session_id", "") or ""),
-        kind=HANDOFF_KIND,
-        title=title,
-        startup_system_message=handoff_message(state, doc),
-        first_user_message=message.strip(),
-        spawn_policy="root",
-        lifetime="independent",
-    )
-
-
-def _launch_handoff(launcher: Any, request: RuntimeLaunch) -> Any:
-    return launcher.start(launcher.prepare(request))
-
-
-def _has_live_backend(state: Any) -> bool:
-    if hasattr(state, "session_launcher"):
-        return getattr(state, "session_launcher", None) is not None
-    return bool(
+def _unavailable(ctx: CommandContext) -> str | None:
+    state = ctx.state
+    has_live = bool(
         str(getattr(state, "_session_id", "") or "").strip()
         and str(getattr(state, "_instance_id", "") or "").strip()
     )
-
-
-def _unavailable(ctx: CommandContext) -> str | None:
-    if not _has_live_backend(ctx.state):
-        return "/handoff requires a live agent backend."
-    return None
+    return None if has_live else "/handoff requires a live agent backend."
 
 
 def _pending_ops(state: Any) -> dict[str, dict[str, Any]]:
@@ -189,7 +113,7 @@ def _pending_ops(state: Any) -> dict[str, dict[str, Any]]:
 
 
 class HandoffCompletionHandler:
-    """Handle off-loop ``/handoff`` launch completion and emit attach + notice."""
+    """Handle ``SpawnSession`` completion for ``/handoff`` and emit attach + notice."""
 
     handles = (IoCompleted, IoFailed)
     init = {_HANDOFF_OPS_ATTR: dict}
@@ -200,40 +124,35 @@ class HandoffCompletionHandler:
         if not isinstance(event, (IoCompleted, IoFailed)):
             return
         ops = getattr(state, _HANDOFF_OPS_ATTR, None)
-        if not isinstance(ops, dict):
+        if not isinstance(ops, dict) or event.op_id not in ops:
             return
-        meta = ops.pop(event.op_id, None)
-        if meta is None:
-            return
+        meta = ops.pop(event.op_id)
 
         if isinstance(event, IoFailed):
-            emit(
-                EmitNotice(
-                    f"Failed to spawn handoff session: {event.error}",
-                    level="error",
-                )
-            )
+            emit(EmitNotice(f"Failed to spawn handoff session: {event.error}", level="error"))
             emit(ProjectionRequested())
             return
 
-        handle = event.value
-        child = str(meta["child"])
-        state.io.submit(
-            ReplyFrontendRequest(
-                channel="core",
-                event_type="attach",
-                payload={"session_id": child, "kind": HANDOFF_KIND},
-            ),
-            tag="frontend",
+        res = event.value
+        if not isinstance(res, SessionSpawnResult) or not res.session_id:
+            emit(EmitNotice("Failed to spawn handoff session: unexpected spawn result.", level="error"))
+            emit(ProjectionRequested())
+            return
+
+        attach: dict[str, Any] = {"session_id": res.session_id, "kind": HANDOFF_KIND}
+        if res.instance_id:
+            attach["instance_id"] = res.instance_id
+        if res.websocket_url:
+            attach["websocket_url"] = res.websocket_url
+        state.io.submit(PublishView(attach=attach), tag="frontend")
+
+        notice = (
+            f"Spawned handoff session · {res.session_id[:8]} · seeded with handoff of entries "
+            f"{meta['doc_start']}-{meta['doc_end']}.{meta['note']}"
         )
-        stderr_path = getattr(handle, "stderr_path", "")
-        emit(
-            EmitNotice(
-                f"Spawned handoff session · {child[:8]} · seeded with handoff of entries "
-                f"{meta['doc_start']}-{meta['doc_end']}.{meta['note']} "
-                f"Logs: {stderr_path}"
-            )
-        )
+        if res.stderr_path:
+            notice += f" Logs: {res.stderr_path}"
+        emit(EmitNotice(notice))
         emit(ProjectionRequested())
 
 
@@ -245,10 +164,17 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
         if doc is None:
             return CommandResult.error(NO_HANDOFF)
 
-        effective_config = config if config is not None else ctx.config
-        request = build_request(state, effective_config, doc, message)
-        launcher = getattr(state, "session_launcher", None) or RuntimeLauncher()
-        child = request.target.session_id
+        cfg = (config if config is not None else ctx.config) or {}
+        context = dict(getattr(state, "_agent_zoo_context", None) or {})
+        provenance = cfg.get("_runtime_launch", {}) or {}
+        model = str((cfg.get("llm", {}) or {}).get("default") or getattr(state, "active_model", "") or "")
+        project = str(context.get("project_name") or getattr(state, "_project_name", "") or "")
+        if not project or not model:
+            raise CommandError("/handoff needs a live backend with a known project and model.")
+
+        parent_session_id = str(getattr(state, "_session_id", "") or "")
+        parent_title = _parent_title(state)
+        title = f"handoff: {parent_title}"[:MAX_TITLE_CHARS] if parent_title else "handoff"
         later = unsummarized_entries(state, doc)
         note = (
             f" The handoff predates the last {later} transcript entries; run /compact "
@@ -256,13 +182,51 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
             if later
             else ""
         )
-
+        handoff_doc = doc.text.strip()
         op_id = ctx.submit_io(
-            RunPluginTask(fn=_launch_handoff, args=(launcher, request)),
+            SpawnSession(
+                source=SessionSource(kind="fresh"),
+                spec=SessionSpec(
+                    project=project,
+                    workdir=_session_workdir(state),
+                    model=model,
+                    env_name=str((cfg.get("pilot", {}) or {}).get("_env_name") or ""),
+                    config_path=str(provenance.get("config_path") or ""),
+                    config_sets=tuple(provenance.get("config_sets") or ()),
+                    state_root=str(provenance.get("state_root") or context.get("state_root") or ""),
+                    store_root=str(context.get("project_store_root") or ""),
+                    local_state_root=str(
+                        getattr(state, "_persistence_local_root", "")
+                        or provenance.get("local_state_root")
+                        or ""
+                    ),
+                    kind=HANDOFF_KIND,
+                    title=title,
+                    parent_session_id=parent_session_id,
+                    startup_system_message=handoff_message(state, doc),
+                    first_user_message=message.strip(),
+                    spawn_policy="root",
+                    lifetime="independent",
+                ),
+                inputs=(
+                    SessionArtifact(
+                        name="handoff_doc",
+                        kind="text",
+                        data=handoff_doc,
+                        content_type="text/markdown",
+                        metadata={
+                            "source_session_id": parent_session_id,
+                            "source_start_entry_index": doc.source_start_entry_index,
+                            "source_end_entry_index": doc.source_end_entry_index,
+                            "unsummarized_entries": later,
+                        },
+                    ),
+                ),
+                wait_ready=False,
+            ),
             tag="handoff",
         )
         _pending_ops(state)[op_id] = {
-            "child": child,
             "doc_start": doc.source_start_entry_index,
             "doc_end": doc.source_end_entry_index,
             "note": note,
@@ -284,10 +248,7 @@ def register_features(builder: Any, *, session: Any, config: Any) -> None:
     builder.add(
         Feature(
             name="handoff_command",
-            components=[
-                make_handoff_command(config),
-                HandoffCompletionHandler(),
-            ],
+            components=[make_handoff_command(config), HandoffCompletionHandler()],
             order=[IoFence, HandoffCompletionHandler, Command],
         )
     )
