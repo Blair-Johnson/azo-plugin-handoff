@@ -13,9 +13,8 @@ from typing import Any
 from agent_utils.core.events import Event, IoCompleted, IoFailed, SessionRestored
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
-from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
-from agent_zoo.durability import session_context, session_state
+from agent_zoo.durability import session_context, session_cwd, session_state
 from agent_zoo.events import (
     EmitNotice,
     ProjectionRequested,
@@ -67,14 +66,6 @@ def _parent_title(state: Any) -> str:
         if title:
             return title
     return ""
-
-
-def _session_workdir(state: Any) -> str:
-    has_cwd = any(
-        str(getattr(state, attr, "") or "").strip()
-        for attr in ("cwd", "session_cwd", "terminal_cwd")
-    )
-    return resolve_session_path("", state) if has_cwd else ""
 
 
 def unsummarized_entries(state: Any, doc: Any) -> int:
@@ -200,7 +191,7 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
                 source=SessionSource(kind="fresh"),
                 spec=SessionSpec(
                     project=project,
-                    workdir=_session_workdir(state),
+                    workdir=session_cwd(state),
                     model=model,
                     env_name=str((cfg.get("pilot", {}) or {}).get("_env_name") or ""),
                     config_path=str(sctx.config_path or ""),
