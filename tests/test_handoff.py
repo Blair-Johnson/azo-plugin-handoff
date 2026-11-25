@@ -13,6 +13,7 @@ from agent_utils.core.state import State
 from agent_utils.features.core import core_feature
 from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
 from agent_zoo.drivers.sessions import SimSessionDriver
+from agent_zoo.durability import session_context, session_state
 from agent_zoo.events import (
     EmitNotice,
     PublishView,
@@ -71,21 +72,23 @@ def make_state(tmp_path, docs=(), entries=12) -> State:
     state.context_compaction = cc
     state.entries = [SimpleNamespace(index=i, step=0) for i in range(entries)]
     state.step = 6
-    state._session_id = "parent-session"
-    state._instance_id = "parent-instance"
-    state._session_title = "Parser work"
-    state._agent_zoo_context = {
-        "project_name": "demo",
-        "project_store_root": str(tmp_path / "store"),
-        "state_root": str(tmp_path / "state"),
-    }
-    state._persistence_local_root = str(tmp_path / "local")
+    smeta = session_state(state)
+    smeta.session_id = "parent-session"
+    smeta.instance_id = "parent-instance"
+    smeta.title = "Parser work"
+    smeta.project_name = "demo"
+    sctx = session_context(state)
+    sctx.project_name = "demo"
+    sctx.store_root = str(tmp_path / "store")
+    sctx.state_root = str(tmp_path / "state")
+    sctx.local_state_root = str(tmp_path / "local")
+    sctx.config_path = ""
+    sctx.config_sets = ("a.b=1",)
     return state
 
 
 CONFIG = {
     "llm": {"default": "opus"},
-    "_runtime_launch": {"config_path": "", "config_sets": ("a.b=1",)},
 }
 
 
@@ -104,7 +107,7 @@ def run_pipeline(state: State, raw="/handoff", config=CONFIG):
             )
         )
     )
-    handoff.register_features(builder, session=session, config=config)
+    handoff.register_features(builder, config=config)
     session.pipeline = builder.build(suppress_warnings=True)
 
     sim_sessions = SimSessionDriver()
@@ -221,7 +224,7 @@ def test_skips_handoffs_beyond_a_rewound_transcript(tmp_path):
 
 def test_unavailable_without_live_backend(tmp_path):
     state = make_state(tmp_path, [make_doc(5)])
-    state._session_id = ""
+    session_state(state).session_id = ""
     registry = CommandRegistry([handoff.make_handoff_command(CONFIG)])
     ctx = CommandContext(
         state=state,
@@ -242,13 +245,14 @@ def test_handoff_pipeline_is_strictly_sans_io():
     builder = build_default_builder(
         session, config={}, include_plugins=False, include_llm_drivers=False
     )
-    handoff.register_features(builder, session=session, config={})
+    handoff.register_features(builder, config={})
     assert_pipeline_sans_io(builder.build())
 
 
 def test_missing_project_or_model_raises_command_error(tmp_path):
     state = make_state(tmp_path, [make_doc(5)])
-    state._agent_zoo_context = {}
+    session_state(state).project_name = ""
+    session_context(state).project_name = ""
     registry = CommandRegistry([handoff.make_handoff_command({"llm": {"default": "opus"}})])
     ctx = CommandContext(
         state=state,
@@ -296,7 +300,7 @@ def test_spawn_failure_emits_error_notice_and_no_attach(tmp_path):
             )
         )
     )
-    handoff.register_features(builder, session=session, config=CONFIG)
+    handoff.register_features(builder, config=CONFIG)
     session.pipeline = builder.build(suppress_warnings=True)
 
     effects = session.step(SlashCommand(raw="/handoff"))
@@ -313,7 +317,7 @@ def test_spawn_failure_emits_error_notice_and_no_attach(tmp_path):
 
 def test_registers_one_feature():
     added = []
-    handoff.register_features(SimpleNamespace(add=added.append), session=None, config={})
+    handoff.register_features(SimpleNamespace(add=added.append), config={})
     (feature,) = added
     assert feature.name == "handoff_command"
     paths = [getattr(c, "path", None) for c in feature.components if hasattr(c, "path")]
@@ -346,7 +350,7 @@ def test_composes_onto_default_builder():
         include_plugins=False,
         include_llm_drivers=False,
     )
-    handoff.register_features(builder, session=session, config={})
+    handoff.register_features(builder, config={})
     pipeline = builder.build()
     assert any(
         isinstance(comp, handoff.HandoffCompletionHandler) for comp in pipeline
@@ -400,7 +404,7 @@ def test_spawn_session_passes_real_session_driver_contract(tmp_path):
         .add(core_feature())
         .add(commands_feature(config=CONFIG))
     )
-    handoff.register_features(builder, session=session, config=CONFIG)
+    handoff.register_features(builder, config=CONFIG)
     session.pipeline = builder.build(suppress_warnings=True)
 
     effects = session.step(SlashCommand(raw="/handoff continue work"))

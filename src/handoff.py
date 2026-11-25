@@ -15,7 +15,7 @@ from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
-from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import session_context, session_state
 from agent_zoo.events import (
     EmitNotice,
     ProjectionRequested,
@@ -177,15 +177,14 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
             return CommandResult.error(NO_HANDOFF)
 
         smeta = session_state(state)
+        sctx = session_context(state)
         cfg = (config if config is not None else ctx.config) or {}
-        context = dict(getattr(state, "_agent_zoo_context", None) or {})
-        provenance = cfg.get("_runtime_launch", {}) or {}
         model = str((cfg.get("llm", {}) or {}).get("default") or getattr(state, "active_model", "") or "")
-        project = str(smeta.project_name or context.get("project_name") or "")
+        project = str(smeta.project_name or sctx.project_name or "")
         if not project or not model:
             raise CommandError("/handoff needs a live backend with a known project and model.")
 
-        parent_session_id = str(smeta.session_id or "")
+        parent_session_id = str(smeta.session_id or sctx.session_id or "")
         parent_title = _parent_title(state)
         title = f"handoff: {parent_title}"[:MAX_TITLE_CHARS] if parent_title else "handoff"
         later = unsummarized_entries(state, doc)
@@ -204,15 +203,11 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
                     workdir=_session_workdir(state),
                     model=model,
                     env_name=str((cfg.get("pilot", {}) or {}).get("_env_name") or ""),
-                    config_path=str(provenance.get("config_path") or ""),
-                    config_sets=tuple(provenance.get("config_sets") or ()),
-                    state_root=str(provenance.get("state_root") or context.get("state_root") or ""),
-                    store_root=str(context.get("project_store_root") or ""),
-                    local_state_root=str(
-                        getattr(state, "_persistence_local_root", "")
-                        or provenance.get("local_state_root")
-                        or ""
-                    ),
+                    config_path=str(sctx.config_path or ""),
+                    config_sets=tuple(sctx.config_sets or ()),
+                    state_root=str(sctx.state_root or ""),
+                    store_root=str(sctx.store_root or ""),
+                    local_state_root=str(sctx.local_state_root or ""),
                     kind=HANDOFF_KIND,
                     title=title,
                     parent_session_id=parent_session_id,
@@ -256,8 +251,7 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
     )
 
 
-def register_features(builder: Any, *, session: Any, config: Any) -> None:
-    del session
+def register_features(builder: Any, *, config: Any) -> None:
     builder.add(
         Feature(
             name="handoff_command",

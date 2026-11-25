@@ -28,6 +28,7 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
     from agent_zoo.cli.wsctl import AzoWs
     from agent_zoo.config.loader import load_layered_config
     from agent_zoo.drivers.sessions import AgentZooSessionDriver
+    from agent_zoo.durability import session_context
     from agent_zoo.events import PublishView, SlashCommand, SpawnSession
     from agent_zoo.features.commands import commands_feature
     from agent_zoo.host.launch import RuntimeLauncher
@@ -36,11 +37,6 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
     from test_handoff import make_doc, make_state
 
     config = load_layered_config(state_root=home)
-    config["_runtime_launch"] = {
-        "config_path": "",
-        "config_sets": (),
-        "state_root": str(home),
-    }
     if not (config.get("llm") or {}).get("default"):
         pytest.skip("bundled config has no default model")
 
@@ -57,7 +53,10 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
         tmp_path, [make_doc(5, "MEMORY-MARKER: parser refactor is half done.")]
     )
     state.cwd = str(workdir)
-    state._agent_zoo_context["state_root"] = str(home)
+    sctx = session_context(state)
+    sctx.state_root = str(home)
+    sctx.config_path = ""
+    sctx.config_sets = ()
 
     session = Session(state=state)
     builder = (
@@ -65,14 +64,14 @@ def test_child_runtime_starts_with_handoff_in_transcript(tmp_path, monkeypatch):
         .add(core_feature())
         .add(commands_feature(config=config))
     )
-    handoff.register_features(builder, session=session, config=config)
+    handoff.register_features(builder, config=config)
     session.pipeline = builder.build(suppress_warnings=True)
 
     inbox: queue.Queue = queue.Queue()
     driver = AgentZooSessionDriver(
         launcher=RecordingLauncher(),
-        store_root=state._agent_zoo_context["project_store_root"],
-        local_state_root=state._persistence_local_root,
+        store_root=sctx.store_root,
+        local_state_root=sctx.local_state_root,
     )
     driver.start(inbox.put)
     try:
