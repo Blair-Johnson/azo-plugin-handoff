@@ -233,6 +233,19 @@ def test_unavailable_without_live_backend(tmp_path):
         registry.execute("/handoff", ctx)
 
 
+def test_handoff_pipeline_is_strictly_sans_io():
+    from agent_utils.core.session import Session
+    from agent_zoo.pipelines.default import build_default_builder
+    from agent_zoo.testing import assert_pipeline_sans_io
+
+    session = Session()
+    builder = build_default_builder(
+        session, config={}, include_plugins=False, include_llm_drivers=False
+    )
+    handoff.register_features(builder, session=session, config={})
+    assert_pipeline_sans_io(builder.build())
+
+
 def test_missing_project_or_model_raises_command_error(tmp_path):
     state = make_state(tmp_path, [make_doc(5)])
     state._agent_zoo_context = {}

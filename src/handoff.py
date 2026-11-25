@@ -7,13 +7,15 @@ handoff document, so it keeps the working memory without the token cost.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
-from agent_utils.core.events import Event, IoCompleted, IoFailed
+from agent_utils.core.events import Event, IoCompleted, IoFailed, SessionRestored
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.buffers.tools import resolve_session_path
 from agent_utils.features.core import IoFence
+from agent_zoo.core.feature_state import session_state
 from agent_zoo.events import (
     EmitNotice,
     ProjectionRequested,
@@ -35,7 +37,13 @@ from agent_zoo.features.compaction import latest_applicable_handoff
 
 HANDOFF_KIND = "handoff"
 MAX_TITLE_CHARS = 80
-_HANDOFF_OPS_ATTR = "_handoff_ops"
+_RUNTIME_KEY = "handoff_command"
+
+
+@dataclass
+class _HandoffRuntime:
+    pending_ops: dict[str, dict[str, Any]] = field(default_factory=dict)
+
 
 NO_HANDOFF = (
     "This session has no handoff document yet. Handoffs are written by harness "
@@ -53,8 +61,9 @@ def _entry_index(state: Any) -> int:
 
 
 def _parent_title(state: Any) -> str:
-    for name in ("_session_title", "_session_name"):
-        title = str(getattr(state, name, "") or "").strip()
+    smeta = session_state(state)
+    for raw in (smeta.title, smeta.name):
+        title = str(raw or "").strip()
         if title:
             return title
     return ""
@@ -75,7 +84,7 @@ def unsummarized_entries(state: Any, doc: Any) -> int:
 
 def handoff_message(state: Any, doc: Any) -> str:
     """Frame the handoff document as the new session's opening system message."""
-    session_id = str(getattr(state, "_session_id", "") or "")
+    session_id = str(session_state(state).session_id or "")
     title = _parent_title(state)
     source = f'"{title}" (session {session_id})' if title else f"session {session_id}"
     intro = (
@@ -96,35 +105,38 @@ def handoff_message(state: Any, doc: Any) -> str:
 
 
 def _unavailable(ctx: CommandContext) -> str | None:
-    state = ctx.state
+    smeta = session_state(ctx.state)
     has_live = bool(
-        str(getattr(state, "_session_id", "") or "").strip()
-        and str(getattr(state, "_instance_id", "") or "").strip()
+        str(smeta.session_id or "").strip()
+        and str(smeta.instance_id or "").strip()
     )
     return None if has_live else "/handoff requires a live agent backend."
 
 
 def _pending_ops(state: Any) -> dict[str, dict[str, Any]]:
-    ops = getattr(state, _HANDOFF_OPS_ATTR, None)
+    runtime_fn = getattr(state, "runtime", None)
+    if callable(runtime_fn):
+        return runtime_fn(_RUNTIME_KEY, _HandoffRuntime).pending_ops
+    ops = getattr(state, "_handoff_ops_fallback", None)
     if not isinstance(ops, dict):
         ops = {}
-        setattr(state, _HANDOFF_OPS_ATTR, ops)
+        setattr(state, "_handoff_ops_fallback", ops)
     return ops
 
 
 class HandoffCompletionHandler:
     """Handle ``SpawnSession`` completion for ``/handoff`` and emit attach + notice."""
 
-    handles = (IoCompleted, IoFailed)
-    init = {_HANDOFF_OPS_ATTR: dict}
-    optional_reads = {_HANDOFF_OPS_ATTR}
-    writes = {_HANDOFF_OPS_ATTR}
+    handles = (SessionRestored, IoCompleted, IoFailed)
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, SessionRestored):
+            _pending_ops(state).clear()
+            return
         if not isinstance(event, (IoCompleted, IoFailed)):
             return
-        ops = getattr(state, _HANDOFF_OPS_ATTR, None)
-        if not isinstance(ops, dict) or event.op_id not in ops:
+        ops = _pending_ops(state)
+        if event.op_id not in ops:
             return
         meta = ops.pop(event.op_id)
 
@@ -164,15 +176,16 @@ def make_handoff_command(config: dict[str, Any] | None) -> Command:
         if doc is None:
             return CommandResult.error(NO_HANDOFF)
 
+        smeta = session_state(state)
         cfg = (config if config is not None else ctx.config) or {}
         context = dict(getattr(state, "_agent_zoo_context", None) or {})
         provenance = cfg.get("_runtime_launch", {}) or {}
         model = str((cfg.get("llm", {}) or {}).get("default") or getattr(state, "active_model", "") or "")
-        project = str(context.get("project_name") or getattr(state, "_project_name", "") or "")
+        project = str(smeta.project_name or context.get("project_name") or "")
         if not project or not model:
             raise CommandError("/handoff needs a live backend with a known project and model.")
 
-        parent_session_id = str(getattr(state, "_session_id", "") or "")
+        parent_session_id = str(smeta.session_id or "")
         parent_title = _parent_title(state)
         title = f"handoff: {parent_title}"[:MAX_TITLE_CHARS] if parent_title else "handoff"
         later = unsummarized_entries(state, doc)
